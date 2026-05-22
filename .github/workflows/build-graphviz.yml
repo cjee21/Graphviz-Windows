@@ -1,0 +1,286 @@
+# Modified from code generated with Google Gemini 3.1 Pro
+
+name: Build and Release Graphviz
+
+on:
+  schedule:
+    - cron: '0 0 * * 3' # 00:00 UTC every Wednesday (0=Sun, 1=Mon, 2=Tue, 3=Wed)
+  workflow_dispatch:
+
+jobs:
+  prepare_release:
+    name: Determine Version and Release Status
+    runs-on: windows-latest
+    outputs:
+      GRAPHVIZ_VERSION: ${{ steps.vcpkg_info.outputs.GRAPHVIZ_VERSION }}
+      GRAPHVIZ_TAG: ${{ steps.vcpkg_info.outputs.GRAPHVIZ_TAG }}
+      SKIP_BUILD: ${{ steps.check_release.outputs.SKIP_BUILD }}
+    steps:
+      - name: Update vcpkg and Determine Graphviz Version
+        id: vcpkg_info
+        shell: pwsh
+        run: |
+          $vcpkg_dir = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg_dir) { $vcpkg_dir = "C:\vcpkg" }
+          cd $vcpkg_dir
+          
+          git pull origin master
+          .\bootstrap-vcpkg.bat
+          
+          $gv_json_path = "$vcpkg_dir\ports\graphviz\vcpkg.json"
+          $gv_json = Get-Content $gv_json_path | ConvertFrom-Json
+          $gv_version = $gv_json.'version-semver'
+          
+          echo "GRAPHVIZ_VERSION=$gv_version" >> $env:GITHUB_OUTPUT
+          echo "GRAPHVIZ_TAG=v$gv_version" >> $env:GITHUB_OUTPUT
+          Write-Output "Detected Graphviz version: $gv_version"
+
+      - name: Check if Release Already Exists
+        id: check_release
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          $tag = "${{ steps.vcpkg_info.outputs.GRAPHVIZ_TAG }}"
+          $headers = @{
+            Authorization = "Bearer ${{ secrets.GITHUB_TOKEN }}"
+          }
+          try {
+            Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" -Headers $headers -ErrorAction Stop
+            Write-Output "Release $tag already exists. Skipping build."
+            echo "SKIP_BUILD=true" >> $env:GITHUB_OUTPUT
+          } catch {
+            Write-Output "Release $tag does not exist. Proceeding with build."
+            echo "SKIP_BUILD=false" >> $env:GITHUB_OUTPUT
+          }
+
+  build_graphviz:
+    name: Build Graphviz (${{ matrix.arch }})
+    needs: prepare_release
+    if: needs.prepare_release.outputs.SKIP_BUILD == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            os: windows-latest
+            output_dir: Win32
+          - arch: x64
+            os: windows-latest
+            output_dir: x64
+          - arch: arm64
+            os: windows-11-arm  # Required to natively execute dot.exe -c
+            output_dir: ARM64
+            
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Create Custom Triplet for Standalone DLL
+        shell: pwsh
+        run: |
+          $triplets_dir = "$env:GITHUB_WORKSPACE\custom-triplets"
+          New-Item -ItemType Directory -Force -Path $triplets_dir | Out-Null
+          echo "TRIPLETS_DIR=$triplets_dir" >> $env:GITHUB_ENV
+          
+          $architectures = @("x86", "x64", "arm64")
+          
+          foreach ($arch in $architectures) {
+            $triplet_content = @"
+          set(VCPKG_TARGET_ARCHITECTURE $arch)
+          set(VCPKG_CRT_LINKAGE static)
+          set(VCPKG_LIBRARY_LINKAGE dynamic)
+          set(VCPKG_BUILD_TYPE release)
+
+          set(VCPKG_CXX_FLAGS "${VCPKG_CXX_FLAGS} /guard:cf")
+          set(VCPKG_C_FLAGS "${VCPKG_C_FLAGS} /guard:cf")
+          set(VCPKG_LINKER_FLAGS "${VCPKG_LINKER_FLAGS} /guard:cf")
+          "@
+            $triplet_path = "$triplets_dir\$arch-windows-standalone.cmake"
+            $triplet_content | Out-File -FilePath $triplet_path -Encoding utf8
+          }
+
+          $host_arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
+          if ($host_arch -eq "amd64") { $host_arch = "x64" }
+          
+          $host_content = @"
+          set(VCPKG_TARGET_ARCHITECTURE $host_arch)
+          set(VCPKG_CRT_LINKAGE static)
+          set(VCPKG_LIBRARY_LINKAGE static)
+          set(VCPKG_BUILD_TYPE release)
+          "@
+          $host_path = "$triplets_dir\host-windows-release.cmake"
+          $host_content | Out-File -FilePath $host_path -Encoding utf8
+          
+          Write-Host "Created target triplet matching architecture: ${{ matrix.arch }}"
+          Write-Host "Created custom runtime host build triplet matching runner: $host_arch"
+
+      - name: Update and Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          $vcpkg_dir = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg_dir) { $vcpkg_dir = "C:\vcpkg" }
+          
+          Write-Host "Updating vcpkg in $vcpkg_dir"
+          cd $vcpkg_dir
+          git pull origin master
+          .\bootstrap-vcpkg.bat
+          
+          echo "VCPKG_DIR=$vcpkg_dir" >> $env:GITHUB_ENV
+
+      - name: Build Graphviz via vcpkg
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_DIR
+          .\vcpkg.exe install graphviz[tools]:${{ matrix.arch }}-windows-standalone --host-triplet=host-windows-release --overlay-triplets="$env:TRIPLETS_DIR"
+
+      - name: Stage Artifacts
+        shell: pwsh
+        run: |
+          $TargetDir = "$env:VCPKG_DIR\installed\${{ matrix.arch }}-windows-standalone"
+          $BinDir = "$TargetDir\bin"
+          $ToolsDir = "$TargetDir\tools\graphviz"
+          $StageDir = "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}"
+          
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          
+          Write-Host "Staging all DLLs and executables together..."
+          
+          Copy-Item -Path "$BinDir\*.dll" -Destination "$StageDir\" -Force
+          Copy-Item -Path "$ToolsDir\*" -Destination "$StageDir\" -Force
+
+      - name: Generate Graphviz Plugin Config natively
+        shell: pwsh
+        run: |
+          $StageDir = "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}"
+          cd $StageDir
+
+          Write-Host "Registering Graphviz layout plugins inside: $BinDir"
+          
+          # Execute dot to map cairo/pango plugins into config8
+          & ".\dot.exe" -c
+          
+          if (Test-Path "config8") {
+              Write-Host "Success! config8 plugin manifest generated successfully."
+          } else {
+              Write-Error "Failed to generate config8 file!"
+              exit 1
+          }
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: graphviz-${{ matrix.output_dir }}
+          path: stage_${{ matrix.arch }}\*
+
+      - name: Checkout MediaInfo
+        uses: actions/checkout@v6
+        with:
+          repository: MediaArea/MediaInfo
+          path: MediaInfo
+
+      - name: Setup MSVC Environment
+        uses: ./MediaInfo/.github/actions/setup-msvc
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Build MediaInfo
+        run: |
+          cmake -G Ninja -D CMAKE_PREFIX_PATH=./cmake-prefix/ -D CMAKE_INSTALL_PREFIX=./cmake-install/ -D CMAKE_BUILD_TYPE=Release -D BUILD_ZENLIB=ON -D BUILD_ZLIB=ON -D ZLIB_BUILD_SHARED=OFF -D ZLIB_BUILD_TESTING=OFF -B build ./MediaInfo/Project/CMake/CLI/
+          cmake --build build
+          cmake --install build
+          Copy-Item -Path ".\cmake-install\bin\mediainfo.exe" -Destination "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}\" -Force
+
+      - name: Test graph generation
+        run: .\stage_${{ matrix.arch }}\mediainfo.exe --Output=Graph_Svg --LogFile="graph_output.svg" "test_data\Audio_ID_720p_25fps_h264_6ch_128kbps_ac4.mp4"
+
+      - name: Upload graph output
+        uses: actions/upload-artifact@v7
+        with:
+          name: graph-output-svg-${{ matrix.output_dir }}
+          path: graph_output.svg
+
+      - name: Verify SVG file validity
+        shell: pwsh
+        run: |
+          # 1. Define the path to your file (update this to your file's path)
+          $FilePath = "graph_output.svg"
+
+          Write-Host "Checking if $FilePath is a valid SVG..."
+
+          # 2. Check if the file exists
+          if (-not (Test-Path -Path $FilePath -PathType Leaf)) {
+              Write-Error "::error file=$FilePath::File does not exist!"
+              exit 1
+          }
+          try {
+              # 3. Attempt to parse it as XML
+              [xml]$xml = Get-Content -Path $FilePath -Raw -ErrorAction Stop
+        
+              # 4. Check if the root element is 'svg'
+              if ($xml.DocumentElement.LocalName -eq "svg") {
+                  Write-Host "Success: $FilePath is a valid SVG file."
+                  exit 0
+              } else {
+                  Write-Error "::error file=$FilePath::The file is valid XML, but the root element is not '<svg>'."
+                  exit 1
+              }
+          }
+          catch {
+              # 5. Handle XML parsing failures
+              Write-Error "::error file=$FilePath::File failed to parse as valid XML. It is either corrupted or not an SVG."
+              exit 1
+          }
+
+  create_release:
+    name: Package and Release
+    needs: [prepare_release, build_graphviz]
+    if: needs.prepare_release.outputs.SKIP_BUILD == 'false'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all Architecture Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Package Release Zip
+        shell: pwsh
+        run: |
+          $staging_dir = "release_staging"
+          New-Item -ItemType Directory -Force -Path $staging_dir | Out-Null
+          
+          # Explicit map linking target folder output name to the exact uploaded artifact name
+          $arch_mappings = @{
+            "Win32" = "graphviz-Win32"
+            "x64"   = "graphviz-x64"
+            "ARM64" = "graphviz-ARM64"
+          }
+          
+          foreach ($target_folder in $arch_mappings.Keys) {
+            $artifact_name = $arch_mappings[$target_folder]
+            $target_dir = "$staging_dir\$target_folder"
+            New-Item -ItemType Directory -Force -Path $target_dir | Out-Null
+            
+            # Grabs files out of downloaded artifact folder and drops them into clean layout folder
+            Copy-Item -Path "artifacts\$artifact_name\*" -Destination "$target_dir\" -Recurse -Force
+          }
+          
+          Compress-Archive -Path "$staging_dir\*" -DestinationPath "graphviz.zip" -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ needs.prepare_release.outputs.GRAPHVIZ_TAG }}
+          name: "Graphviz ${{ needs.prepare_release.outputs.GRAPHVIZ_VERSION }}"
+          body: |
+            Automated build of `Graphviz` version **${{ needs.prepare_release.outputs.GRAPHVIZ_VERSION }}** using vcpkg.
+            
+            Compiled with the **Static C Runtime (`/MT`)**.
+            
+            Includes pre-generated `config8` mapping layouts and formatted in a `$arch\` directory structure.
+          files: graphviz.zip
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
