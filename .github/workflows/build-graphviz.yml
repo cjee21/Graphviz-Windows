@@ -155,7 +155,7 @@ jobs:
           $StageDir = "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}"
           cd $StageDir
 
-          Write-Host "Registering Graphviz layout plugins inside: $BinDir"
+          Write-Host "Registering Graphviz layout plugins inside: $StageDir"
           
           # Execute dot to map cairo/pango plugins into config8
           & ".\dot.exe" -c
@@ -173,6 +173,66 @@ jobs:
           name: graphviz-${{ matrix.output_dir }}
           path: stage_${{ matrix.arch }}\*
 
+      - name: Generate Minimal Artifact
+        shell: pwsh
+        run: |
+          $StageDir = "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}"
+          $MinStageDir = "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}_minimal"
+          $fileListPath = "$env:GITHUB_WORKSPACE\minimal_dll_list.txt"
+          $sourceFolder = "$StageDir"
+          $destinationFolder = "$MinStageDir"
+
+          # Create destination folder if it doesn't exist
+          if (!(Test-Path -Path $destinationFolder)) {
+              New-Item -ItemType Directory -Path $destinationFolder | Out-Null
+          }
+
+          # Read the list of files
+          $filesToCopy = Get-Content -Path $fileListPath
+
+          # Loop through each file and copy it
+          foreach ($fileName in $filesToCopy) {
+              # Skip empty lines if any exist in the text file
+              if ([string]::IsNullOrWhiteSpace($fileName)) { continue }
+
+              # Combine the source folder path with the file name
+              $sourceFilePath = Join-Path -Path $sourceFolder -ChildPath $fileName
+
+              # Check if the file actually exists in the source folder before copying
+              if (Test-Path -Path $sourceFilePath) {
+                  Copy-Item -Path $sourceFilePath -Destination $destinationFolder -Force
+                  Write-Host "Successfully copied: $fileName" -ForegroundColor Green
+              } else {
+                  Write-Warning "File not found in source: $fileName"
+              }
+          }
+
+          # Copy dot.exe needed to generate config
+          Copy-Item -Path "$sourceFolder\dot.exe" -Destination $destinationFolder -Force
+
+          cd $MinStageDir
+
+          Write-Host "Registering Graphviz layout plugins inside: $MinStageDir"
+          
+          # Execute dot to map cairo/pango plugins into config8
+          & ".\dot.exe" -c
+          
+          if (Test-Path "config8") {
+              Write-Host "Success! config8 plugin manifest generated successfully."
+          } else {
+              Write-Error "Failed to generate config8 file!"
+              exit 1
+          }
+
+          # Delete dot.exe that is no longer needed
+          Remove-Item -Path "$MinStageDir\dot.exe"
+
+      - name: Upload Minimal Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: graphviz-${{ matrix.output_dir }}-minimal
+          path: stage_${{ matrix.arch }}_minimal\*
+
       - name: Checkout MediaInfo
         uses: actions/checkout@v6
         with:
@@ -189,10 +249,10 @@ jobs:
           cmake -G Ninja -D CMAKE_PREFIX_PATH=./cmake-prefix/ -D CMAKE_INSTALL_PREFIX=./cmake-install/ -D CMAKE_BUILD_TYPE=Release -D BUILD_ZENLIB=ON -D BUILD_ZLIB=ON -D ZLIB_BUILD_SHARED=OFF -D ZLIB_BUILD_TESTING=OFF -B build ./MediaInfo/Project/CMake/CLI/
           cmake --build build
           cmake --install build
-          Copy-Item -Path ".\cmake-install\bin\mediainfo.exe" -Destination "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}\" -Force
+          Copy-Item -Path ".\cmake-install\bin\mediainfo.exe" -Destination "$env:GITHUB_WORKSPACE\stage_${{ matrix.arch }}_minimal\" -Force
 
       - name: Test graph generation
-        run: .\stage_${{ matrix.arch }}\mediainfo.exe --Output=Graph_Svg --LogFile="graph_output.svg" "test_data\Audio_ID_720p_25fps_h264_6ch_128kbps_ac4.mp4"
+        run: .\stage_${{ matrix.arch }}_minimal\mediainfo.exe --Output=Graph_Svg --LogFile="graph_output.svg" "test_data\Audio_ID_720p_25fps_h264_6ch_128kbps_ac4.mp4"
 
       - name: Upload graph output
         uses: actions/upload-artifact@v7
@@ -269,6 +329,30 @@ jobs:
           
           Compress-Archive -Path "$staging_dir\*" -DestinationPath "graphviz.zip" -Force
 
+      - name: Package Minimal Release Zip
+        shell: pwsh
+        run: |
+          $staging_dir = "minimal_release_staging"
+          New-Item -ItemType Directory -Force -Path $staging_dir | Out-Null
+          
+          # Explicit map linking target folder output name to the exact uploaded artifact name
+          $arch_mappings = @{
+            "Win32" = "graphviz-Win32-minimal"
+            "x64"   = "graphviz-x64-minimal"
+            "ARM64" = "graphviz-ARM64-minimal"
+          }
+          
+          foreach ($target_folder in $arch_mappings.Keys) {
+            $artifact_name = $arch_mappings[$target_folder]
+            $target_dir = "$staging_dir\$target_folder"
+            New-Item -ItemType Directory -Force -Path $target_dir | Out-Null
+            
+            # Grabs files out of downloaded artifact folder and drops them into clean layout folder
+            Copy-Item -Path "artifacts\$artifact_name\*" -Destination "$target_dir\" -Recurse -Force
+          }
+          
+          Compress-Archive -Path "$staging_dir\*" -DestinationPath "graphviz-dll-minimal.zip" -Force
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
@@ -280,7 +364,9 @@ jobs:
             Compiled with the **Static C Runtime (`/MT`)**.
             
             Includes pre-generated `config8` mapping layouts and formatted in a `$arch\` directory structure.
-          files: graphviz.zip
+          files: |
+            graphviz.zip
+            graphviz-dll-minimal.zip
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
